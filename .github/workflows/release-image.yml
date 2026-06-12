@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       open_webui_version:
-        description: 'custom Open WebUI with github copilot sdk'
+        description: 'Upstream Open WebUI image tag (e.g. main, v0.3.30)'
         required: true
         default: 'main'
 
@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/open-webui-custom
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/open-webui-ykps
 
 jobs:
   build-and-push:
