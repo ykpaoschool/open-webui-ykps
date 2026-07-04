@@ -1,12 +1,21 @@
 name: Build and Publish Custom Open WebUI Image
 
+# Escape-hatch workflow for one-off builds (e.g. rebuilding an older version
+# for rollback testing, or building upstream `main` for verification).
+# Day-to-day upgrades are handled automatically by track-upstream.yml + ci-build.yml.
+
 on:
   workflow_dispatch:
     inputs:
       open_webui_version:
-        description: 'Upstream Open WebUI image tag (e.g. main, v0.3.30)'
-        required: true
-        default: 'main'
+        description: 'Upstream Open WebUI image tag (e.g. v0.10.1, main). Defaults to UPSTREAM_VERSION when blank.'
+        required: false
+        default: ''
+      tag_latest:
+        description: 'Also tag the build as `latest` (use with care; can clobber the stable latest).'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,6 +32,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve upstream version
+        id: ver
+        run: |
+          if [ -z "${{ inputs.open_webui_version }}" ]; then
+            version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')
+          else
+            version="${{ inputs.open_webui_version }}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -36,8 +55,9 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ github.event.inputs.open_webui_version }}
-            type=raw,value=latest
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=sha
+            type=raw,value=latest,enable=${{ inputs.tag_latest }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -45,6 +65,6 @@ jobs:
           context: .
           push: true
           build-args: |
-            OPEN_WEBUI_VERSION=${{ github.event.inputs.open_webui_version }}
+            OPEN_WEBUI_VERSION=${{ steps.ver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
