@@ -19,6 +19,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read pinned upstream version
+        id: ver
+        run: echo "version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -32,6 +36,7 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
             type=sha
             type=raw,value=latest
 
@@ -41,6 +46,6 @@ jobs:
           context: .
           push: true
           build-args: |
-            OPEN_WEBUI_VERSION=main
+            OPEN_WEBUI_VERSION=${{ steps.ver.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

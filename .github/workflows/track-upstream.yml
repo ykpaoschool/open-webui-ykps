@@ -1,0 +1,83 @@
+name: Track Upstream Open WebUI
+
+on:
+  schedule:
+    # Daily at 06:17 UTC (off-peak minute)
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read current pinned version
+        id: current
+        run: |
+          echo "version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch latest upstream release
+        id: latest
+        run: |
+          tag=$(curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/open-webui/open-webui/releases/latest \
+            | jq -r .tag_name)
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "Failed to fetch latest upstream release" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Compare versions
+        id: cmp
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys
+          cur = "${{ steps.current.outputs.version }}".lstrip("v").split(".")
+          new = "${{ steps.latest.outputs.version }}".lstrip("v").split(".")
+          def tup(v):
+              out = []
+              for p in v:
+                  n = ""
+                  for ch in p:
+                      if ch.isdigit(): n += ch
+                      else: break
+                  out.append(int(n) if n else 0)
+              return tuple(out)
+          newer = tup(new) > tup(cur)
+          print(f"newer={'true' if newer else 'false'}")
+          PY
+
+      - name: Bump UPSTREAM_VERSION
+        if: steps.cmp.outputs.newer == 'true'
+        run: |
+          printf '%s\n' "${{ steps.latest.outputs.version }}" > UPSTREAM_VERSION
+
+      - name: Open pull request
+        if: steps.cmp.outputs.newer == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: |
+            chore(deps): bump upstream open-webui to ${{ steps.latest.outputs.version }}
+          branch: bump/upstream-${{ steps.latest.outputs.version }}
+          title: |
+            chore(deps): bump upstream open-webui to ${{ steps.latest.outputs.version }}
+          body: |
+            Upstream Open WebUI released a new stable version.
+
+            - Current: `${{ steps.current.outputs.version }}`
+            - Latest:  `${{ steps.latest.outputs.version }}`
+            - Release notes: https://github.com/open-webui/open-webui/releases/tag/${{ steps.latest.outputs.version }}
+
+            Merging this PR will trigger `ci-build.yml`, which builds and publishes the image tagged with this version (and updates `latest`).
+          labels: dependencies
+          delete-branch: true
