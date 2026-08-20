@@ -1,2 +1,6 @@
 github-copilot-sdk==0.2.3
 openai-codex==0.1.0b3
+python-docx
+latex2mathml
+mathml2omml
+yfinance==0.2.66
