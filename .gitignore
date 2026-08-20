@@ -16,7 +16,12 @@ Thumbs.db
 *.swp
 *.swo
 
+
 # Environment
 .env
 .venv/
 venv/
+
+# Coding Agent
+.claude
+.codex
