@@ -4,3 +4,11 @@ python-docx
 latex2mathml
 mathml2omml
 yfinance==0.2.66
+skia-pathops==0.9.2
+uharfbuzz==0.50.0
+edge-tts==7.2.8
+PyMuPDF==1.23.0
+mammoth==1.6.0
+markdownify==0.11.6
+ebooklib==0.18
+nbconvert==7.0.0
