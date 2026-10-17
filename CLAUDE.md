@@ -28,11 +28,19 @@ The source of truth for the tracked upstream version is [`UPSTREAM_VERSION`](UPS
 
 Three workflows cooperate:
 
-- **`track-upstream.yml`** — runs daily (and on manual dispatch). Polls `open-webui/open-webui`'s latest stable release; if newer than `UPSTREAM_VERSION`, opens a PR bumping the file. Merge the PR to upgrade.
+- **`track-upstream.yml`** — runs daily (and on manual dispatch). Lists `open-webui/open-webui`'s recent releases, filters out drafts and prereleases, and if any stable version is newer than `UPSTREAM_VERSION`, opens a PR bumping the file to the *oldest* missing one. Merge the PR to upgrade.
 - **`ci-build.yml`** — runs on every push to `main` (dependency changes *and* upstream bumps). Reads `UPSTREAM_VERSION`, builds the image, and tags it with the version string, the commit SHA, and `latest`. Rebuilding the same version after a dependency change refreshes the deps without moving the upstream baseline.
 - **`release-image.yml`** — manual escape hatch for one-off builds (e.g. rebuilding an old version for rollback testing, or building `main` for verification). Defaults to `UPSTREAM_VERSION` when no version is given; does **not** tag `latest` unless explicitly opted in.
 
 `latest` is only ever written by `ci-build.yml` (i.e. from a stable `UPSTREAM_VERSION`), never from upstream `main`.
+
+### Why upstream tracking reads the release list, and bumps one version per run
+
+`track-upstream.yml` queries `releases?per_page=100` instead of `releases/latest`. Upstream can publish several stable versions between two daily polls, and asking only for the latest one made the versions in between invisible — `v0.12.1` (published 2026-10-14, four hours before `v0.12.2`) was never queried and was silently skipped. The list is filtered (`draft`/`prerelease` dropped, tags must be semver-shaped so `main` or `v0.12.0-rc1` can never be selected), sorted numerically, and the workflow bumps to the **oldest** missing version.
+
+Catch-up is deliberately serial: each run opens at most one PR, and the next gap is picked up by the next daily run after that PR merges. Do not change this to "one PR per gap" — every bump edits the same single-line `UPSTREAM_VERSION`, so parallel PRs conflict and go stale as soon as one merges. Do not backfill by pointing `UPSTREAM_VERSION` at an older tag either: `latest` is derived from that file by `ci-build.yml` and must only ever move forward. An already-skipped version is backfilled with a manual `release-image.yml` dispatch (`tag_latest` off), which is how `v0.12.1` was recovered.
+
+To verify a change to this workflow: dispatch it with `dry_run=true` (the default for manual runs) — it prints the current version, the stable releases in the window, and the full gap list to the job summary without touching anything. Add `simulate_current_version=v0.11.0` to fake the pinned version and exercise the gap logic against real upstream data.
 
 ## Repo Structure
 

@@ -1,14 +1,49 @@
 name: Track Upstream Open WebUI
 
+# Why this workflow lists releases instead of asking for `releases/latest`:
+#   Upstream can publish more than one stable release between two daily polls.
+#   `releases/latest` only ever returns the newest one, so the versions published
+#   in between were never queried and were silently skipped (v0.12.1 on
+#   2026-10-14 is the real occurrence). We now read the release list, drop
+#   drafts/prereleases, sort by semver and bump to the OLDEST missing version,
+#   so every gap is eventually picked up.
+#
+# Why one version per run (serial catch-up) and not one PR per gap:
+#   Every bump edits the same single-line `UPSTREAM_VERSION`, so parallel bump
+#   PRs conflict with each other and the later ones go stale. Bumping the oldest
+#   gap first, then letting the next daily run find the next gap, keeps exactly
+#   one open PR at a time and moves `latest` strictly forward.
+#
+# Do NOT "fix" a gap by pointing UPSTREAM_VERSION at an older tag:
+#   `latest` is written only by ci-build.yml from UPSTREAM_VERSION, so moving it
+#   backwards would make `latest` regress. Backfilling an already-skipped version
+#   is a manual `release-image.yml` dispatch, never an edit of this file.
+#
+# Do NOT add a build path for upstream main/dev here:
+#   Only stable, semver-shaped tags from the release list are ever considered.
+
 on:
   schedule:
     # Daily at 06:17 UTC (off-peak minute)
     - cron: '17 6 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report the gap list; do not modify files or open a PR.'
+        type: boolean
+        default: true
+      simulate_current_version:
+        description: 'Dry run only: pretend UPSTREAM_VERSION is this tag (e.g. v0.11.0) to exercise the gap logic.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: track-upstream
+  cancel-in-progress: false
 
 jobs:
   check-and-bump:
@@ -18,66 +53,199 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Read current pinned version
-        id: current
+      - name: Resolve run mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN_INPUT: ${{ github.event.inputs.dry_run }}
+          SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
         run: |
-          echo "version=$(cat UPSTREAM_VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Fetch latest upstream release
-        id: latest
-        run: |
-          tag=$(curl -fsSL \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/open-webui/open-webui/releases/latest \
-            | jq -r .tag_name)
-          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-            echo "Failed to fetch latest upstream release" >&2
+          # Scheduled runs always act for real; manual dispatches default to dry run.
+          dry="true"
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$DRY_RUN_INPUT" = "false" ]; then
+            dry="false"
+          fi
+          if [ -n "$SIMULATE_INPUT" ] && [ "$dry" != "true" ]; then
+            echo "::error::simulate_current_version is only allowed with dry_run=true"
             exit 1
           fi
-          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry" >> "$GITHUB_OUTPUT"
 
-      - name: Compare versions
-        id: cmp
+      - name: Read current pinned version
+        id: current
+        env:
+          SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
         run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import sys
-          cur = "${{ steps.current.outputs.version }}".lstrip("v").split(".")
-          new = "${{ steps.latest.outputs.version }}".lstrip("v").split(".")
-          def tup(v):
-              out = []
-              for p in v:
-                  n = ""
-                  for ch in p:
-                      if ch.isdigit(): n += ch
-                      else: break
-                  out.append(int(n) if n else 0)
-              return tuple(out)
-          newer = tup(new) > tup(cur)
-          print(f"newer={'true' if newer else 'false'}")
+          if [ -n "$SIMULATE_INPUT" ]; then
+            version="$SIMULATE_INPUT"
+            echo "::notice::Simulating current UPSTREAM_VERSION as $version"
+          else
+            version=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::UPSTREAM_VERSION is empty"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch recent upstream releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES_JSON: ${{ runner.temp }}/releases.json
+        run: |
+          # One page of 100 is far more than the number of releases upstream can
+          # publish between two daily polls; the page is only a window, not a
+          # historical record. A truncation warning is emitted downstream.
+          gh api "repos/open-webui/open-webui/releases?per_page=100" > "$RELEASES_JSON"
+          jq -e 'type == "array" and length > 0' "$RELEASES_JSON" > /dev/null
+          echo "Fetched $(jq length "$RELEASES_JSON") releases"
+
+      - name: Compute missing stable versions
+        id: gaps
+        env:
+          CUR_VERSION: ${{ steps.current.outputs.version }}
+          RELEASES_JSON: ${{ runner.temp }}/releases.json
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          SIMULATE_INPUT: ${{ github.event.inputs.simulate_current_version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          # Tags like v0.12.1 only. This rejects branches (main, dev) and
+          # pre-release/build suffixes, so no non-stable tag can ever be built.
+          SEMVER = re.compile(r"v?(\d+(?:\.\d+)*)")
+
+          def parse(tag):
+              m = SEMVER.fullmatch(tag.strip())
+              if not m:
+                  return None
+              return tuple(int(p) for p in m.group(1).split("."))
+
+          def fmt(key):
+              return "v" + ".".join(str(p) for p in key)
+
+          cur_raw = os.environ["CUR_VERSION"].strip()
+          cur = parse(cur_raw)
+          if cur is None:
+              sys.exit(f"Invalid current version: {cur_raw!r}")
+
+          with open(os.environ["RELEASES_JSON"], encoding="utf-8") as fh:
+              releases = json.load(fh)
+
+          stable = {}
+          skipped = []
+          for rel in releases:
+              tag = (rel.get("tag_name") or "").strip()
+              if rel.get("draft"):
+                  skipped.append(f"{tag} (draft)")
+                  continue
+              if rel.get("prerelease"):
+                  skipped.append(f"{tag} (prerelease)")
+                  continue
+              key = parse(tag)
+              if key is None:
+                  skipped.append(f"{tag} (not semver)")
+                  continue
+              # The list is newest-first, so keep the first occurrence.
+              stable.setdefault(key, tag)
+
+          missing_keys = sorted(k for k in stable if k > cur)
+          missing = [stable[k] for k in missing_keys]
+          next_version = missing[0] if missing else ""
+          newest = max(stable) if stable else None
+
+          cur_seen = cur in stable
+          truncated = len(releases) >= 100
+
+          lines = [
+              "### Upstream release check",
+              "",
+              "| | |",
+              "|---|---|",
+              f"| Current `UPSTREAM_VERSION` | `{cur_raw}`{' (simulated)' if os.environ.get('SIMULATE_INPUT') else ''} |",
+              f"| Stable releases in window | {len(stable)} |",
+              f"| Newest stable release | `{fmt(newest)}` |" if newest else "| Newest stable release | none |",
+              f"| Missing versions (newer than current) | {len(missing)} |",
+              f"| Bumping to (oldest gap) | `{next_version}` |" if next_version else "| Bumping to | nothing to do |",
+              "",
+          ]
+          if missing:
+              lines += ["Gap list, oldest → newest: " + ", ".join(f"`{v}`" for v in missing), ""]
+              if len(missing) > 1:
+                  lines += [
+                      f"Serial catch-up: {len(missing) - 1} more version(s) remain after this one. "
+                      "The next daily run will pick up the next gap once this PR is merged.",
+                      "",
+                  ]
+          if not cur_seen:
+              lines += [f"⚠️ Current version `{cur_raw}` is not in the fetched window; the gap list covers only releases in that window.", ""]
+          elif truncated:
+              lines += ["ℹ️ Release list capped at 100 items; all releases newer than the current version are inside the window.", ""]
+          if skipped:
+              preview = ", ".join(skipped[:10]) + (" …" if len(skipped) > 10 else "")
+              lines += [f"Skipped: {preview}", ""]
+          if os.environ.get("DRY_RUN") == "true":
+              lines += ["**Dry run — no files were modified and no PR was opened.**", ""]
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          print("\n".join(lines))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"next={next_version}\n")
+              fh.write(f"newest={fmt(newest) if newest else ''}\n")
+              fh.write(f"count={len(missing)}\n")
+              fh.write("missing_inline=" + ", ".join(f"`{v}`" for v in missing) + "\n")
+              fh.write("remaining_inline=" + ", ".join(f"`{v}`" for v in missing[1:]) + "\n")
           PY
 
-      - name: Bump UPSTREAM_VERSION
-        if: steps.cmp.outputs.newer == 'true'
+      - name: Check for an already-open bump PR
+        id: pr
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: bump/upstream-${{ steps.gaps.outputs.next }}
         run: |
-          printf '%s\n' "${{ steps.latest.outputs.version }}" > UPSTREAM_VERSION
+          # Explicit check rather than relying on create-pull-request's
+          # same-branch semantics: an open PR for this exact version means the
+          # bump is already waiting for review, so re-running must be a no-op.
+          n=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$n" -gt 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Open PR already exists for $BRANCH; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump UPSTREAM_VERSION
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false' && steps.pr.outputs.exists == 'false'
+        env:
+          NEXT: ${{ steps.gaps.outputs.next }}
+        run: printf '%s\n' "$NEXT" > UPSTREAM_VERSION
 
       - name: Open pull request
-        if: steps.cmp.outputs.newer == 'true'
+        if: steps.gaps.outputs.next != '' && steps.mode.outputs.dry_run == 'false' && steps.pr.outputs.exists == 'false'
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: |
-            chore(deps): bump upstream open-webui to ${{ steps.latest.outputs.version }}
-          branch: bump/upstream-${{ steps.latest.outputs.version }}
+            chore(deps): bump upstream open-webui to ${{ steps.gaps.outputs.next }}
+          branch: bump/upstream-${{ steps.gaps.outputs.next }}
           title: |
-            chore(deps): bump upstream open-webui to ${{ steps.latest.outputs.version }}
+            chore(deps): bump upstream open-webui to ${{ steps.gaps.outputs.next }}
           body: |
-            Upstream Open WebUI released a new stable version.
+            Upstream Open WebUI has stable releases newer than the tracked version.
 
             - Current: `${{ steps.current.outputs.version }}`
-            - Latest:  `${{ steps.latest.outputs.version }}`
-            - Release notes: https://github.com/open-webui/open-webui/releases/tag/${{ steps.latest.outputs.version }}
+            - Bumping to (oldest gap): `${{ steps.gaps.outputs.next }}`
+            - Newest stable: `${{ steps.gaps.outputs.newest }}`
+            - All missing versions: ${{ steps.gaps.outputs.missing_inline }}
+            - Release notes: https://github.com/open-webui/open-webui/releases/tag/${{ steps.gaps.outputs.next }}
 
-            Merging this PR will trigger `ci-build.yml`, which builds and publishes the image tagged with this version (and updates `latest`).
+            Merging this PR triggers `ci-build.yml`, which builds and publishes `${{ steps.gaps.outputs.next }}` and moves `latest` to it.
+
+            Version bumps are applied one at a time because they all edit the same `UPSTREAM_VERSION`, and `latest` must only move forward. Remaining gaps after this merge: ${{ steps.gaps.outputs.remaining_inline || 'none' }} — the next daily run opens the next PR.
           labels: dependencies
           delete-branch: true
