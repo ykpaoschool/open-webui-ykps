@@ -7,7 +7,10 @@ yfinance==0.2.66
 skia-pathops==0.9.2
 uharfbuzz==0.50.0
 edge-tts==7.2.8
-PyMuPDF==1.23.0
+# PyMuPDF < 1.23.5 has no cp312 wheels. Upstream moved the image to
+# python 3.12 in v0.12.4; on that base pip falls back to compiling PyMuPDF
+# from source and the build fails (no toolchain in the final image).
+PyMuPDF==1.23.15
 mammoth==1.6.0
 markdownify==0.11.6
 ebooklib==0.18
