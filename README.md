@@ -9,7 +9,16 @@ This image tracks upstream Open WebUI stable releases. The currently tracked ver
 ## How upgrades work
 
 - A daily workflow polls upstream for new stable releases and opens a PR bumping `UPSTREAM_VERSION` when one is found.
+- If several stable releases appeared since the last poll, it opens the oldest untracked one first; the remaining ones follow on subsequent runs, so no version is skipped. One bump PR is open at a time.
 - Merging that PR triggers CI, which builds and publishes the new version (and moves `latest`).
 - Dependency changes (`requirements.txt`) rebuild the *current* tracked version in place — they don't advance the Open WebUI baseline.
+
+## Checking pending upstream versions
+
+```bash
+gh workflow run track-upstream.yml -f dry_run=true
+```
+
+Prints the pinned version, the stable releases found upstream, and the full list of untracked versions to the run's job summary, without modifying anything. Manual dispatches default to `dry_run=true`; the scheduled run always applies the bump.
 
 See [CLAUDE.md](CLAUDE.md) for the full workflow details.
